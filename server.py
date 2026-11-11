@@ -38,6 +38,7 @@ run_state: dict[str, Any] = {
     "latest_frame": None,
     "stop_event": None,
     "thread": None,
+    "capture": None,
 }
 
 
@@ -83,21 +84,84 @@ def set_run_state(**values: Any) -> None:
         run_state.update(values)
 
 
-def process_stream(source: int | str, source_name: str, confidence: float, stop_event: threading.Event, temp_path: str | None = None) -> None:
-    capture = None
-    try:
-        if isinstance(source, int) and os.name == "nt":
-            capture = cv2.VideoCapture(source, cv2.CAP_DSHOW)
-        else:
-            capture = cv2.VideoCapture(source)
+def _read_frame_with_timeout(capture: Any, timeout: float = 3.0) -> tuple[bool, Any, bool]:
+    """Read one frame without blocking forever. Returns (success, frame, timed_out)."""
+    result: dict[str, Any] = {"success": False, "frame": None, "timed_out": False}
 
+    def worker() -> None:
+        try:
+            success, frame = capture.read()
+            result["success"] = bool(success)
+            result["frame"] = frame
+        except Exception as error:  # pragma: no cover - defensive
+            result["error"] = str(error)
+
+    thread = threading.Thread(target=worker, daemon=True, name="camera-read-probe")
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        result["timed_out"] = True
+        try:
+            capture.release()
+        except Exception:
+            pass
+        thread.join(timeout=1.0)
+    return bool(result["success"]), result["frame"], bool(result["timed_out"])
+
+
+def _open_capture(source: int | str) -> tuple[Any, Any]:
+    """Open a capture and verify it can return at least one frame."""
+    if isinstance(source, int) and os.name == "nt":
+        backends: list[int | None] = [cv2.CAP_DSHOW, cv2.CAP_MSMF, None]
+    elif isinstance(source, int):
+        backends = [None]
+    else:
+        backends = [None]
+
+    for backend in backends:
+        capture = cv2.VideoCapture(source, backend) if backend is not None else cv2.VideoCapture(source)
         if not capture.isOpened():
-            raise RuntimeError("Could not open the webcam or video. Check that the camera is connected or choose another file.")
+            try:
+                capture.release()
+            except Exception:
+                pass
+            continue
 
         if isinstance(source, int):
-            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            capture.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            capture.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        success, frame, timed_out = _read_frame_with_timeout(capture)
+        if timed_out:
+            try:
+                capture.release()
+            except Exception:
+                pass
+            continue
+        if success and frame is not None:
+            return capture, frame
+        try:
+            capture.release()
+        except Exception:
+            pass
+
+    if isinstance(source, int):
+        raise RuntimeError(
+            "Could not read from the webcam. Check that a camera is connected, not in use by another app, "
+            "and that camera access is allowed. Tried DirectShow, Media Foundation, and the default backend."
+        )
+    raise RuntimeError("Could not open the video file. Check that it is a valid, readable video.")
+
+
+def process_stream(source: int | str, source_name: str, confidence: float, stop_event: threading.Event, temp_path: str | None = None) -> None:
+    capture = None
+    first_frame = None
+    try:
+        capture, first_frame = _open_capture(source)
+
+        with LOCK:
+            run_state["capture"] = capture
 
         set_run_state(status="loading_model", active=True, source=source_name, error="", fps=0.0, frames=0, objects=0, classes={}, latest_frame=None)
         detector = get_model()
@@ -106,10 +170,17 @@ def process_stream(source: int | str, source_name: str, confidence: float, stop_
         last_fps_at = started_at
         frames_since_fps = 0
         current_fps = 0.0
+        frame_count = 0
+        pending_frame = first_frame
 
         while not stop_event.is_set():
-            success, frame = capture.read()
-            if not success:
+            if pending_frame is not None:
+                frame = pending_frame
+                pending_frame = None
+                success = True
+            else:
+                success, frame = capture.read()
+            if not success or frame is None:
                 set_run_state(status="ended" if not isinstance(source, int) else "error", active=False)
                 if isinstance(source, int):
                     set_run_state(error="The webcam stopped returning frames. Try starting it again.")
@@ -124,7 +195,7 @@ def process_stream(source: int | str, source_name: str, confidence: float, stop_
                 persist=True,
                 tracker=TRACKER_NAME,
                 conf=confidence,
-                imgsz=640,
+                imgsz=480,
                 verbose=False,
             )[0]
             annotated = result.plot(line_width=2, font_size=0.55)
@@ -137,11 +208,12 @@ def process_stream(source: int | str, source_name: str, confidence: float, stop_
                     current_fps = frames_since_fps / (now - last_fps_at)
                     frames_since_fps = 0
                     last_fps_at = now
+                frame_count += 1
                 set_run_state(
                     status="running",
                     active=True,
                     fps=round(current_fps, 1),
-                    frames=run_state["frames"] + 1,
+                    frames=frame_count,
                     objects=len(objects),
                     classes=class_counts,
                     latest_frame=encoded.tobytes(),
@@ -151,7 +223,10 @@ def process_stream(source: int | str, source_name: str, confidence: float, stop_
         set_run_state(status="error", active=False, error=str(error))
     finally:
         if capture is not None:
-            capture.release()
+            try:
+                capture.release()
+            except Exception:
+                pass
         if temp_path:
             try:
                 Path(temp_path).unlink(missing_ok=True)
@@ -161,8 +236,10 @@ def process_stream(source: int | str, source_name: str, confidence: float, stop_
             run_state["active"] = False
             run_state["stop_event"] = None
             run_state["thread"] = None
-            if run_state["status"] in {"running", "loading_model"}:
-                run_state["status"] = "stopped"
+            run_state["capture"] = None
+            if run_state["status"] in {"running", "loading_model", "starting"}:
+                if run_state["status"] != "error":
+                    run_state["status"] = "stopped"
 
 
 def start_stream(source: int | str, source_name: str, confidence: float, temp_path: str | None = None):
@@ -181,6 +258,7 @@ def start_stream(source: int | str, source_name: str, confidence: float, temp_pa
             error="",
             latest_frame=None,
             stop_event=stop_event,
+            capture=None,
         )
         worker = threading.Thread(
             target=process_stream,
@@ -255,12 +333,21 @@ def stop_stream():
     with LOCK:
         stop_event = run_state.get("stop_event")
         worker = run_state.get("thread")
+        capture = run_state.get("capture")
         if not stop_event or not run_state["active"]:
             return jsonify(current_status())
         run_state["status"] = "stopping"
         stop_event.set()
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                pass
     if worker and worker is not threading.current_thread():
-        worker.join(timeout=2)
+        worker.join(timeout=3)
+        if worker.is_alive():
+            # Last resort: releasing again cannot hurt; report current state.
+            pass
     return jsonify(current_status())
 
 
